@@ -18,14 +18,39 @@ package collector
 import (
 	"context"
 	"database/sql"
+	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 const ndbinfoTableMemoryUsageQuery = `
 	SELECT database_name, table_name, in_memory_bytes, free_in_memory_bytes, disk_memory_bytes, free_disk_memory_bytes
 	FROM ndbinfo.table_memory_usage;
 	`
+
+// The scan reads every fragment of every table, so its cost grows with the cluster's table count, while
+// table sizes change slowly. With an interval, scrapes in between get the last result.
+var ndbinfoTableMemoryUsageInterval = kingpin.Flag(
+	"collect.ndbinfo.table_memory_usage.interval",
+	"Minimum time between two scans of ndbinfo.table_memory_usage; scrapes in between get the last result. 0 scans on every scrape.",
+).Default("0s").Duration()
+
+type tableMemoryUsage struct {
+	databaseName        string
+	tableName           string
+	inMemoryBytes       uint64
+	freeInMemoryBytes   uint64
+	diskMemoryBytes     uint64
+	freeDiskMemoryBytes uint64
+}
+
+var tableMemoryUsageCache struct {
+	sync.Mutex
+	rows    []tableMemoryUsage
+	scanned time.Time
+}
 
 var (
 	ndbTableMemoryInMemoryDesc = prometheus.NewDesc(
@@ -68,62 +93,50 @@ func (ScrapeNdbinfoTableMemoryUsage) Version() float64 {
 }
 
 func (ScrapeNdbinfoTableMemoryUsage) Scrape(ctx context.Context, db *sql.DB, ch chan<- prometheus.Metric) error {
-	rows, err := db.QueryContext(ctx, ndbinfoTableMemoryUsageQuery)
+	rows, err := tableMemoryUsageRows(ctx, db, *ndbinfoTableMemoryUsageInterval, time.Now())
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-
-	var (
-		databaseName        string
-		tableName           string
-		inMemoryBytes       uint64
-		freeInMemoryBytes   uint64
-		diskMemoryBytes     uint64
-		freeDiskMemoryBytes uint64
-	)
-
-	for rows.Next() {
-		if err := rows.Scan(
-			&databaseName,
-			&tableName,
-			&inMemoryBytes,
-			&freeInMemoryBytes,
-			&diskMemoryBytes,
-			&freeDiskMemoryBytes,
-		); err != nil {
-			return err
-		}
-
-		ch <- prometheus.MustNewConstMetric(
-			ndbTableMemoryInMemoryDesc,
-			prometheus.GaugeValue,
-			float64(inMemoryBytes),
-			databaseName,
-			tableName,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			ndbTableMemoryFreeInMemoryDesc,
-			prometheus.GaugeValue,
-			float64(freeInMemoryBytes),
-			databaseName,
-			tableName,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			ndbTableMemoryDiskMemoryDesc,
-			prometheus.GaugeValue,
-			float64(diskMemoryBytes),
-			databaseName,
-			tableName,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			ndbTableMemoryFreeDiskMemoryDesc,
-			prometheus.GaugeValue,
-			float64(freeDiskMemoryBytes),
-			databaseName,
-			tableName,
-		)
+	for _, row := range rows {
+		ch <- prometheus.MustNewConstMetric(ndbTableMemoryInMemoryDesc, prometheus.GaugeValue,
+			float64(row.inMemoryBytes), row.databaseName, row.tableName)
+		ch <- prometheus.MustNewConstMetric(ndbTableMemoryFreeInMemoryDesc, prometheus.GaugeValue,
+			float64(row.freeInMemoryBytes), row.databaseName, row.tableName)
+		ch <- prometheus.MustNewConstMetric(ndbTableMemoryDiskMemoryDesc, prometheus.GaugeValue,
+			float64(row.diskMemoryBytes), row.databaseName, row.tableName)
+		ch <- prometheus.MustNewConstMetric(ndbTableMemoryFreeDiskMemoryDesc, prometheus.GaugeValue,
+			float64(row.freeDiskMemoryBytes), row.databaseName, row.tableName)
 	}
-
 	return nil
+}
+
+// tableMemoryUsageRows returns the last scan while it is younger than interval, else scans again. A failed scan
+// returns its error and keeps no result, so a scrape never reports sizes older than one interval.
+func tableMemoryUsageRows(ctx context.Context, db *sql.DB, interval time.Duration, now time.Time) ([]tableMemoryUsage, error) {
+	tableMemoryUsageCache.Lock()
+	defer tableMemoryUsageCache.Unlock()
+	if interval > 0 && tableMemoryUsageCache.rows != nil && now.Sub(tableMemoryUsageCache.scanned) < interval {
+		return tableMemoryUsageCache.rows, nil
+	}
+	tableMemoryUsageCache.rows = nil
+	rows, err := db.QueryContext(ctx, ndbinfoTableMemoryUsageQuery)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	scanned := []tableMemoryUsage{}
+	for rows.Next() {
+		var row tableMemoryUsage
+		if err := rows.Scan(&row.databaseName, &row.tableName, &row.inMemoryBytes, &row.freeInMemoryBytes,
+			&row.diskMemoryBytes, &row.freeDiskMemoryBytes); err != nil {
+			return nil, err
+		}
+		scanned = append(scanned, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	tableMemoryUsageCache.rows = scanned
+	tableMemoryUsageCache.scanned = now
+	return scanned, nil
 }
